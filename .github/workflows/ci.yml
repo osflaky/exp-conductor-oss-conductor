@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ 
+    github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: ubuntu-latest
+          java: 25
+          arch: x64
+          runner: ubuntu-latest
+          expander_leg: ubuntu-latest-25-x64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      checks: write
+    env:
+      # Keep the Gradle daemon and in-process javac within the runner/container memory
+      # budget, and disable native file-system watching (it cannot poll inside some
+      # containers: "Couldn't poll for events, error = 4").
+      GRADLE_BUILD_FLAGS: "--no-daemon --no-watch-fs --max-workers=2 -Dorg.gradle.jvmargs=-Xmx2g
+        -Dorg.gradle.parallel=false"
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        fetch-depth: 0
+    - name: Free disk space
+      if: runner.os == 'Linux'
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+      # Validate every gradle-wrapper.jar in the repo against the checksums Gradle
+      # publishes for its releases. The wrapper jar is not tied to the distribution
+      # version in gradle-wrapper.properties, so any official release checksum is accepted.
+    - name: Gradle wrapper validation
+      shell: bash
+      run: |
+        set -euo pipefail
+        sha() {
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$1" | cut -d' ' -f1
+          else
+            shasum -a 256 "$1" | cut -d' ' -f1
+          fi
+        }
+        mapfile -t jars < <(find . -name gradle-wrapper.jar -path '*gradle/wrapper/*' -not -path './.git/*')
+        if [ "${#jars[@]}" -eq 0 ]; then
+          echo "::error::No gradle-wrapper.jar found"
+          exit 1
+        fi
+        mapfile -t urls < <(curl -fsSL --retry 3 https://services.gradle.org/versions/all \
+          | grep -o '"wrapperChecksumUrl" *: *"[^"]*"' \
+          | sed -E 's/.*"(https[^"]*)"$/\1/' \
+          | grep -v -E 'snapshot|milestone|rc-' || true)
+        if [ "${#urls[@]}" -eq 0 ]; then
+          echo "::error::Could not fetch the list of Gradle wrapper checksums"
+          exit 1
+        fi
+        for jar in "${jars[@]}"; do
+          actual=$(sha "$jar")
+          found=""
+          for u in "${urls[@]}"; do
+            expected=$(curl -fsSL --retry 2 "$u" 2>/dev/null | tr -d '[:space:]' || true)
+            if [ "$expected" = "$actual" ]; then
+              found="$u"
+              break
+            fi
+          done
+          if [ -z "$found" ]; then
+            echo "::error::$jar (sha256 $actual) does not match any official Gradle wrapper checksum"
+            exit 1
+          fi
+          echo "$jar is a valid Gradle wrapper ($found)"
+        done
+      # The Gradle wrapper (8.14.3) can only run on JDK <= 24 and build.gradle pins a
+      # Java 21 toolchain. Install the matrix JDK first, then JDK 21 last so it becomes
+      # JAVA_HOME and runs Gradle (and satisfies the toolchain) on every matrix entry.
+    - name: Set up Zulu JDK ${{ matrix.java }}
+      uses: actions/setup-java@v5
+      with:
+        distribution: "zulu"
+        java-version: "${{ matrix.java }}"
+    - name: Set up Zulu JDK 21
+      uses: actions/setup-java@v5
+      with:
+        distribution: "zulu"
+        java-version: "21"
+    - name: Cache SonarCloud packages
+      uses: actions/cache@v5
+      with:
+        path: ~/.sonar/cache
+        key: ${{ runner.os }}-${{ runner.arch }}-sonar
+        restore-keys: ${{ runner.os }}-${{ runner.arch }}-sonar
+    - name: Cache Gradle packages
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+        key: ${{ runner.os }}-${{ runner.arch }}-java${{ matrix.java 
+          }}-gradle-${{ hashFiles('**/*.gradle*', 
+          '**/gradle-wrapper.properties') }}
+        restore-keys: ${{ runner.os }}-${{ runner.arch }}-java${{ matrix.java 
+          }}-gradle-
+    - name: Build with Gradle
+      if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      run: |
+        ./gradlew build -x :conductor-test-harness:test -x test $GRADLE_BUILD_FLAGS
+    - name: Build and Publish snapshot
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      shell: bash
+      run: |
+        echo "Running build for commit ${{ github.sha }}"
+        ./gradlew build -x :conductor-test-harness:test -x test $GRADLE_BUILD_FLAGS
+    - name: Generate aggregated coverage report
+      if: always()
+      shell: bash
+      run: ./gradlew jacocoAggregatedReport -x test $GRADLE_BUILD_FLAGS || true
+      # annotate_only writes the report to the job summary instead of creating a
+      # check run, which tokens without checks:write (forks, PATs) cannot do.
+    - name: Publish Test Report
+      uses: mikepenz/action-junit-report@v6
+      if: always()
+      with:
+        check_name: "JUnit Test Report (${{ matrix.os }}, java ${{ matrix.java }},
+          ${{ matrix.arch }})"
+        report_paths: "**/build/test-results/test/TEST-*.xml"
+        annotate_only: true
+        job_summary: true
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: build-artifacts-${{ matrix.os }}-java${{ matrix.java }}-${{ 
+          matrix.arch }}
+        path: "**/build/reports"
+    - name: Upload coverage report
+      uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: coverage-report-${{ matrix.os }}-java${{ matrix.java }}-${{ 
+          matrix.arch }}
+        path: build/reports/jacoco/aggregated
+    name: build [${{ matrix.expander_leg }}]
+    timeout-minutes: 150
